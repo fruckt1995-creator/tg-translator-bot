@@ -1,199 +1,94 @@
+// api/webhook.js
+// Vercel Serverless handler for Telegram webhook
 
-// api/webhook.js — Vercel serverless webhook (CommonJS)
-// Повна логіка: автокорекція, мішані літери, LanguageTool, uk/ru→pl; інші→ru, /setlang,/mylang,/help
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // <-- обов'язково додай у Vercel
+const API = (method) => `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
 
-const { Telegraf } = require("telegraf");
+// дуже груба мовна евристика: є кирилиця → вважаємо RU/UK → переклад у польську
+// немає кирилиці → інші мови → переклад у російську (можеш змінити на 'uk' якщо треба)
+const hasCyrillic = (s) => /[\u0400-\u04FF]/.test(s);
 
-// ⚠️ На Vercel ми НЕ запускаємо bot.launch()
-// Ми приймаємо HTTP POST і прокидуємо update у Telegraf.
-
-const userPrefs = new Map(); // userId -> langCode
-
-const hasCyr  = s => /[А-Яа-яІіЇїЄєҐґЁёЪъЫыЭэ]/.test(s);
-const looksUkr= s => /[ІіЇїЄєҐґ]/.test(s);
-const looksRus= s => /[ЁёЪъЫыЭэ]/.test(s);
-
-function normLang(code) {
-  if (!code) return null;
-  code = String(code).toLowerCase();
-  const map = {
-    "uk":"uk","ru":"ru","pl":"pl","en":"en","tr":"tr","de":"de","fr":"fr","es":"es","it":"it","pt":"pt",
-    "ar":"ar","fa":"fa","hi":"hi","ja":"ja","ko":"ko","zh":"zh-cn","zh-hans":"zh-cn","zh-cn":"zh-cn",
-    "zh-hant":"zh-tw","zh-tw":"zh-tw"
-  };
-  return map[code] || null;
-}
-
-function memoryPairCode(code) {
-  const map = {"zh-cn":"ZH-CN","zh-tw":"ZH-TW"};
-  return map[code] || code;
-}
-
-function normalizeMixed(text){
-  const latinToCyr = {
-    A:"А",a:"а",B:"В",E:"Е",e:"е",K:"К",k:"к",M:"М",m:"м",
-    H:"Н",O:"О",o:"о",P:"Р",p:"р",C:"С",c:"с",T:"Т",t:"т",X:"Х",x:"х",
-    I:"І",i:"і",Y:"У",y:"у"
-  };
-  const rusToUkr = { "ы":"и","Ы":"И","э":"е","Э":"Е","ъ":"ʼ","Ъ":"ʼ" };
-  const isCyr = s=>/[А-Яа-яІіЇїЄєҐґ]/.test(s);
-  const isLat = s=>/[A-Za-z]/.test(s);
-
-  return text
-    .split(/(\s+)/)
-    .map(tok=>{
-      tok = tok.replace(/[ыЫэЭъЪ]/g, ch => rusToUkr[ch] || ch);
-      if (isCyr(tok) && isLat(tok)) tok = tok.replace(/[A-Za-z]/g, ch => latinToCyr[ch] || ch);
-      return tok;
-    })
-    .join("");
-}
-
-async function autocorrectWithLanguageTool(text){
-  try{
-    const params = new URLSearchParams();
-    params.append("text", text);
-    params.append("language", "auto");
-    const r = await fetch("https://api.languagetool.org/v2/check", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params
-    });
-    const data = await r.json().catch(()=>null);
-    const matches = data?.matches || [];
-    if (!matches.length) return text;
-    return applyLTReplacements(text, matches);
-  }catch(e){
-    return text;
+async function sendMessage(chat_id, text, reply_to_message_id) {
+  const body = { chat_id, text, reply_to_message_id, parse_mode: 'HTML', disable_web_page_preview: true };
+  const r = await fetch(API('sendMessage'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) {
+    console.error('sendMessage error:', r.status, j);
   }
 }
-function applyLTReplacements(original, matches){
-  const ms=[...matches].sort((a,b)=>(a.offset??0)-(b.offset??0));
-  let out="", cursor=0;
-  for(const m of ms){
-    const off=m.offset??0, len=m.length??0, repl=m.replacements?.[0]?.value;
-    if (off < cursor) continue;
-    out += original.slice(cursor, off);
-    out += (typeof repl==="string" ? repl : original.slice(off, off+len));
-    cursor = off + len;
+
+// дуже простий переклад через MyMemory (без ключа)
+async function translateMyMemory(text, from, to) {
+  // MyMemory сам намагається детектити; але задаємо from|to
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j && j.responseData && j.responseData.translatedText) {
+    return j.responseData.translatedText;
   }
-  out += original.slice(cursor);
-  return out;
+  console.warn('MyMemory fallback used, raw:', j);
+  return null;
 }
 
-async function detectLang(text){
-  if (hasCyr(text)) {
-    if (looksUkr(text)) return "uk";
-    if (looksRus(text)) return "ru";
-    return "uk";
+export default async function handler(req, res) {
+  if (req.method === 'GET') {
+    // Telegram інколи дергає GET — просто відповімо 200
+    return res.status(200).send('ok');
   }
+
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
+  }
+
   try {
-    const r = await fetch("https://libretranslate.de/detect", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ q: text })
-    });
-    const data = await r.json().catch(()=>null);
-    const lang = data?.[0]?.language;
-    if (typeof lang === "string" && lang.length === 2) return lang.toLowerCase();
-  }catch(_){}
-  return "en";
-}
+    // Telegram повинен отримати 200 швидко. Ми не «ранньо відповідаємо»,
+    // бо тоді функція може завершитись до відправки повідомлення.
+    const update = req.body || {};
 
-async function translateMyMemory(text, src, tgt){
-  try{
-    const pair = `${memoryPairCode(src)}|${memoryPairCode(tgt)}`;
-    const url = "https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: pair });
-    const r = await fetch(url);
-    const d = await r.json();
-    const out = d?.responseData?.translatedText;
-    if (out && typeof out === "string") return out.trim();
-  }catch(e){}
-  return null;
-}
+    // Логи в Vercel → Deployments → Logs
+    console.log('Incoming update:', JSON.stringify(update));
 
-async function translateLibre(text, src, tgt){
-  const bases = ["https://libretranslate.de","https://translate.astian.org"];
-  for (const base of bases){
-    try{
-      const r = await fetch(`${base}/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q:text, source:src, target:tgt, format:"text" })
-      });
-      const d = await r.json().catch(()=>null);
-      const t = d?.translatedText || d?.translated_text || (Array.isArray(d) && d[0]?.translatedText);
-      if (t) return String(t).trim();
-    }catch(e){}
+    if (!BOT_TOKEN) {
+      console.error('No TELEGRAM_BOT_TOKEN in env!');
+      return res.status(500).send('Missing token');
+    }
+
+    if (!update.message || !update.message.chat) {
+      return res.status(200).send('no message');
+    }
+
+    const chatId = update.message.chat.id;
+    const msgId  = update.message.message_id;
+    const text   = (update.message.text || '').trim();
+
+    if (!text) {
+      await sendMessage(chatId, 'Надішли, будь ласка, текстове повідомлення.', msgId);
+      return res.status(200).send('no text');
+    }
+
+    // Яка цільова мова?
+    const target = hasCyrillic(text) ? 'pl' : 'ru'; // кирилиця → в польську, інші → у російську
+    const source = hasCyrillic(text) ? 'uk' : 'en'; // приблизно (MyMemory все одно детектить)
+
+    // спроба перекладу
+    let translated = null;
+    try {
+      translated = await translateMyMemory(text, source, target);
+    } catch (e) {
+      console.error('Translate error:', e);
+    }
+
+    // якщо не вдалось — віддамо оригінал, аби хоч щось прийшло
+    const out = translated || text;
+
+    await sendMessage(chatId, out, msgId);
+    return res.status(200).send('ok');
+  } catch (err) {
+    console.error('Handler error:', err);
+    return res.status(200).send('ok'); // все одно 200, щоб TG не ретраїв
   }
-  return null;
 }
-
-async function translateSmartToTarget(text, src, tgt){
-  if (!src) src = "auto";
-  if (src!=="auto" && src.toLowerCase()===tgt.toLowerCase()) return null;
-  let out = await translateMyMemory(text, src, tgt);
-  if (out) return out;
-  out = await translateLibre(text, src, tgt);
-  if (out) return out;
-  return null;
-}
-
-let bot = null;
-function ensureBot(){
-  if (bot) return bot;
-  const token = process.env.BOT_TOKEN;
-  if (!token) throw new Error("BOT_TOKEN is missing");
-  const b = new Telegraf(token);
-
-  const helpText = \`Команди:
-  /setlang <код> — зафіксувати цільову мову
-  /mylang — показати цільову мову
-  /help — допомога
-  За замовчуванням: uk/ru → pl, інші → ru.\`;
-
-  b.start(ctx => ctx.reply("Привіт! Я готовий перекладати."));
-  b.help(ctx => ctx.reply(helpText));
-  b.command("mylang", ctx => {
-    const pref = userPrefs.get(ctx.from.id) || "(не встановлено)";
-    ctx.reply(\`Ваше /setlang: \${pref}\`);
-  });
-  b.command("setlang", ctx => {
-    const parts = (ctx.message.text||"").trim().split(/\s+/);
-    const raw = parts[1]?.toLowerCase();
-    if (!raw) return ctx.reply("Вкажіть код мови. Напр.: /setlang pl");
-    const normalized = normLang(raw) || raw;
-    userPrefs.set(ctx.from.id, normalized);
-    ctx.reply(\`Готово! Цільова мова для вас: \${normalized}\`);
-  });
-
-  b.on("text", async (ctx)=>{
-    try{
-      if (ctx.from?.is_bot) return;
-      const raw = ctx.message.text || "";
-      const mixedFixed = normalizeMixed(raw);
-      const corrected = await autocorrectWithLanguageTool(mixedFixed);
-      const src = await detectLang(corrected);
-      const pref = userPrefs.get(ctx.from.id);
-      let target = pref ? pref.toLowerCase() : ((src==="uk"||src==="ru")?"pl":"ru");
-      if (src && target && src.toLowerCase() === target) return;
-      const translated = await translateSmartToTarget(corrected, src, target);
-      if (!translated) return;
-      await ctx.reply(\`Переклад (\${src}→\${target}):\n\${translated}\`, { reply_to_message_id: ctx.message.message_id });
-    }catch(e){}
-  });
-
-  bot = b;
-  return bot;
-}
-
-module.exports = async (req, res) => {
-  try{
-    if (req.method !== "POST") return res.status(200).send("ok");
-    const b = ensureBot();
-    await b.handleUpdate(req.body);
-    return res.status(200).send("ok");
-  }catch(e){
-    return res.status(200).send("ok");
-  }
-};
