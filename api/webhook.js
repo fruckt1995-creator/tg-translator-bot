@@ -1,20 +1,30 @@
 // api/webhook.js
+
+// Повертаємо 200 навіть у разі помилки — щоб Telegram не бачив 500
 export default async function handler(req, res) {
   try {
-    if (req.method === 'POST') {
-      // Telegram надсилає JSON; у Vercel body вже розпарсений
-      const update = req.body;
-      console.log('Incoming update:', JSON.stringify(update));
+    // Перевіряємо токен в env (читаємо обидва варіанти, щоб не було плутанини)
+    const TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
 
-      // Тут нічого не робимо, просто підтверджуємо отримання
+    if (!TOKEN) {
+      console.error('No TELEGRAM_BOT_TOKEN / BOT_TOKEN in env!');
+      // ВАЖЛИВО: відповідаємо 200, щоб Telegram не відключав вебхук
       return res.status(200).send('OK');
     }
 
-    // GET-запит — корисно для перевірки живості
+    if (req.method !== 'POST') {
+      return res.status(200).send('OK');
+    }
+
+    const update = req.body;
+    console.log('Incoming update:', JSON.stringify(update));
+
+    // ---- ТУТ БУДЕ ТВІЙ ЛОГІЧНИЙ КОД (переклад, відповіді і т.д.) ----
+    // Поки що просто підтверджуємо отримання, щоб прибрати 500.
     return res.status(200).send('OK');
   } catch (err) {
-    // Навіть якщо щось впало, відповідь 200 — щоб Telegram не бачив 500
     console.error('Webhook handler error:', err);
+    // Все одно повертаємо 200 — хай Telegram продовжує слати апдейти
     return res.status(200).send('OK');
   }
 }
