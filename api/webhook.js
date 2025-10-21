@@ -1,62 +1,52 @@
 // api/webhook.js
-import axios from "axios";
-
-export default async function handler(req, res) {
-  if (req.method === "GET") {
-    return res.status(200).send("OK"); // для пінгу
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-  }
-
-  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!TOKEN) {
-    console.error("❌ No TELEGRAM_BOT_TOKEN in env!");
-    return res.status(200).send("OK"); // щоб Telegram не ретраїв
-  }
-
-  const update = req.body;
-  console.log("Incoming update:", JSON.stringify(update));
-
+module.exports = async (req, res) => {
   try {
+    if (req.method !== "POST") {
+      return res.status(200).send("OK");
+    }
+
+    const TOKEN =
+      process.env.TELEGRAM_BOT_TOKEN ||
+      process.env.BOT_TOKEN ||
+      process.env.TELEGRAM_TOKEN;
+
+    if (!TOKEN) {
+      console.error("NO TELEGRAM_BOT_TOKEN in env!");
+      return res.status(500).send("NO TOKEN");
+    }
+
+    // Vercel інколи дає body вже розібраним
+    const update = req.body || JSON.parse(req.body || "{}");
+    console.log("Incoming update:", JSON.stringify(update));
+
     const msg =
-      update.message ||
-      update.edited_message ||
-      update.callback_query?.message;
+      update.message || update.edited_message || update.callback_query?.message;
 
     const chatId = msg?.chat?.id;
-    const messageId = msg?.message_id;
-
-    const incomingText =
+    const text =
       update.message?.text ||
       update.edited_message?.text ||
       update.callback_query?.data ||
       "";
 
-    if (!chatId) {
-      console.log("No chat_id in update → nothing to do");
-      return res.status(200).send("OK");
+    if (chatId) {
+      // простий echo — щоб переконатись, що відповіді доходять
+      await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text ? `echo: ${text}` : "✅ бот живий",
+          reply_to_message_id: update.message?.message_id,
+          disable_web_page_preview: true,
+        }),
+      });
     }
 
-    const replyText =
-      incomingText?.trim()
-        ? `✅ Отримав: ${incomingText}`
-        : "👋 Привіт! Надішли мені текст — я відповім.";
-
-    const url = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
-    const payload = {
-      chat_id: chatId,
-      text: replyText,
-      reply_to_message_id: messageId,
-    };
-
-    const tgResp = await axios.post(url, payload, { timeout: 15000 });
-    console.log("sendMessage OK:", tgResp.data);
-  } catch (err) {
-    const data = err?.response?.data;
-    console.error("sendMessage ERROR:", data || err.message || err);
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("Handler error:", e?.message || e);
+    // Відповідаємо 200, щоб Telegram не ретраїв
+    return res.status(200).send("OK");
   }
-
-  // ПОВИННІ швидко відповісти 200, інакше Telegram робить ретраї
-  return res.status(200).send("OK");
-}
+};
